@@ -24,3 +24,7 @@ Dev cycle: `make && make install && xfce4-panel -r`. Stale wrapper process → r
 ## No tests, no CI
 
 Manual verification only: clean build (`-Wall -Wextra` in CFLAGS), install, panel restart, check button/tooltip.
+
+## Conventions
+
+- Spell out names: use `_callback` suffix for callbacks, not `_cb`.

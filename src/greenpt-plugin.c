@@ -108,10 +108,38 @@ static const gchar *REGION_NAME[] = {
   "US",
 };
 
+static const gchar *LABEL_MISSING_KEY = "Missing API Key";
+static const gchar *LABEL_DASH = "\xE2\x80\x94";
+static const gchar *LABEL_EURO = "\xE2\x82\xAC";
+static const gchar *TOOLTIP_LAST_UPDATE = "\nLast update: ";
+static const gchar *CSS_CLASS_LOW = "greenpt-low";
+static const gchar *CSS_LOW_VALUE_RULE = ".greenpt-low { color: #ff4040; }";
+static const gchar *DATA_KEY_EDITED = "greenpt-key-edited";
+static const gchar *CONFIG_GROUP = "greenpt";
+static const gchar *CONFIG_KEY_API = "api_key";
+static const gchar *CONFIG_KEY_REGION = "region";
+static const gchar *CONFIG_KEY_REFRESH_SECONDS = "refresh_seconds";
+static const gchar *CONFIG_KEY_LOW_THRESHOLD = "low_threshold";
+static const gchar *CONFIG_KEY_USE_ENV_TOKEN = "use_env_token";
+static const gchar *ENV_TOKEN_VAR = "GREENPT_API_TOKEN";
+static const gchar *TOOLTIP_ENV_TOKEN_UNSET =
+  "GreenPT: $GREENPT_API_TOKEN is not set and no API key is "
+  "stored — set the variable or enter a key in Properties";
+static const gchar *TOOLTIP_MISSING_KEY =
+  "GreenPT: no API key set — open Properties to configure";
+static const gchar *TOOLTIP_INVALID_KEY = "GreenPT: invalid API key (401)";
+static const gchar *TOOLTIP_NO_CREDITS = "GreenPT: no credits left (402)";
+static const gchar *TOOLTIP_UNSAFE_KEY =
+  "GreenPT: the API key contains control or non-ASCII characters and "
+  "was not sent \xE2\x80\x94 fix $GREENPT_API_TOKEN or the key in Properties";
+static const gchar *TOOLTIP_UPDATE_FAILED = "GreenPT: update failed (%s)%s%s";
+static const gchar *ERROR_HTTP_NO_HEADER = "HTTP %ld without balance header";
+static const gchar *ERROR_UNKNOWN = "unknown error";
+
 /* number of plugin instances that did curl_global_init */
 static gint greenpt_curl_ref_count = 0;
 
-static void greenpt_schedule (GreenptPlugin *greenpt);
+static void greenpt_schedule_refresh (GreenptPlugin *greenpt);
 static void greenpt_config_save (GreenptPlugin *greenpt);
 static gboolean greenpt_key_is_safe (const gchar *key);
 
@@ -140,7 +168,7 @@ greenpt_config_load (GreenptPlugin *greenpt)
   config = g_key_file_new ();
   if (g_key_file_load_from_file (config, file, G_KEY_FILE_NONE, NULL))
     {
-      gchar *stored_key = g_key_file_get_string (config, "greenpt", "api_key", NULL);
+      gchar *stored_key = g_key_file_get_string (config, CONFIG_GROUP, CONFIG_KEY_API, NULL);
       if (stored_key != NULL)
         {
           g_free (greenpt->api_key);
@@ -148,31 +176,25 @@ greenpt_config_load (GreenptPlugin *greenpt)
         }
 
       {
-        gchar *region = g_key_file_get_string (config, "greenpt", "region", NULL);
+        gchar *region = g_key_file_get_string (config, CONFIG_GROUP, CONFIG_KEY_REGION, NULL);
         if (region != NULL && g_ascii_strcasecmp (region, "us") == 0)
           greenpt->region = REGION_US;
         g_free (region);
       }
 
-      greenpt->use_env_token = g_key_file_get_boolean (config, "greenpt",
-                                                  "use_env_token", NULL);
+      greenpt->use_env_token = g_key_file_get_boolean (config, CONFIG_GROUP,
+                                                   CONFIG_KEY_USE_ENV_TOKEN, NULL);
 
       {
-        gint seconds = g_key_file_get_integer (config, "greenpt",
-                                               "refresh_seconds", NULL);
-        if (seconds <= 0)
-          {
-            /* legacy key from older versions */
-            seconds = g_key_file_get_integer (config, "greenpt",
-                                              "refresh_minutes", NULL) * 60;
-          }
+        gint seconds = g_key_file_get_integer (config, CONFIG_GROUP,
+                                               CONFIG_KEY_REFRESH_SECONDS, NULL);
         if (seconds >= MIN_REFRESH_SECONDS)
           greenpt->refresh_seconds = MIN (seconds, MAX_REFRESH_SECONDS);
       }
 
       {
         GError *error = NULL;
-        gdouble threshold = g_key_file_get_double (config, "greenpt", "low_threshold", &error);
+        gdouble threshold = g_key_file_get_double (config, CONFIG_GROUP, CONFIG_KEY_LOW_THRESHOLD, &error);
         if (error == NULL && threshold >= 0.0)
           greenpt->low_threshold = threshold;
         g_clear_error (&error);
@@ -197,11 +219,11 @@ greenpt_config_save (GreenptPlugin *greenpt)
     return;
 
   config = g_key_file_new ();
-  g_key_file_set_string (config, "greenpt", "api_key", greenpt->api_key);
-  g_key_file_set_string (config, "greenpt", "region", REGION_NAME[greenpt->region]);
-  g_key_file_set_integer (config, "greenpt", "refresh_seconds", greenpt->refresh_seconds);
-  g_key_file_set_double (config, "greenpt", "low_threshold", greenpt->low_threshold);
-  g_key_file_set_boolean (config, "greenpt", "use_env_token", greenpt->use_env_token);
+  g_key_file_set_string (config, CONFIG_GROUP, CONFIG_KEY_API, greenpt->api_key);
+  g_key_file_set_string (config, CONFIG_GROUP, CONFIG_KEY_REGION, REGION_NAME[greenpt->region]);
+  g_key_file_set_integer (config, CONFIG_GROUP, CONFIG_KEY_REFRESH_SECONDS, greenpt->refresh_seconds);
+  g_key_file_set_double (config, CONFIG_GROUP, CONFIG_KEY_LOW_THRESHOLD, greenpt->low_threshold);
+  g_key_file_set_boolean (config, CONFIG_GROUP, CONFIG_KEY_USE_ENV_TOKEN, greenpt->use_env_token);
 
   data = g_key_file_to_data (config, &length, NULL);
   if (data != NULL)
@@ -232,7 +254,7 @@ greenpt_resolve_key (GreenptPlugin *greenpt)
 {
   if (greenpt->use_env_token)
     {
-      const gchar *env_token = g_getenv ("GREENPT_API_TOKEN");
+      const gchar *env_token = g_getenv (ENV_TOKEN_VAR);
       if (env_token != NULL && *env_token != '\0')
         return env_token;
     }
@@ -244,24 +266,21 @@ greenpt_show_missing_key (GreenptPlugin *greenpt)
 {
   if (greenpt->use_env_token)
     {
-      const gchar *env_token = g_getenv ("GREENPT_API_TOKEN");
+      const gchar *env_token = g_getenv (ENV_TOKEN_VAR);
       if (env_token == NULL || *env_token == '\0')
         {
-          gtk_label_set_text (GTK_LABEL (greenpt->label), _("Missing API Key"));
-          gtk_widget_set_tooltip_text (greenpt->box,
-            "GreenPT: $GREENPT_API_TOKEN is not set and no API key is "
-            "stored — set the variable or enter a key in Properties");
+          gtk_label_set_text (GTK_LABEL (greenpt->label), _(LABEL_MISSING_KEY));
+          gtk_widget_set_tooltip_text (greenpt->box, TOOLTIP_ENV_TOKEN_UNSET);
           return;
         }
     }
 
-  gtk_label_set_text (GTK_LABEL (greenpt->label), _("Missing API Key"));
-  gtk_widget_set_tooltip_text (greenpt->box,
-    "GreenPT: no API key set — open Properties to configure");
+  gtk_label_set_text (GTK_LABEL (greenpt->label), _(LABEL_MISSING_KEY));
+  gtk_widget_set_tooltip_text (greenpt->box, TOOLTIP_MISSING_KEY);
 }
 
 static size_t
-greenpt_header_cb (gchar *buffer, size_t size, size_t nitems, gpointer user_data)
+greenpt_balance_header_callback (gchar *buffer, size_t size, size_t nitems, gpointer user_data)
 {
   PollResult *poll_result = user_data;
   size_t total = size * nitems;
@@ -286,7 +305,7 @@ greenpt_header_cb (gchar *buffer, size_t size, size_t nitems, gpointer user_data
    teardown interrupt a hung poll instead of blocking the panel for the full
    request timeout */
 static int
-greenpt_xfer_cb (void *clientp, curl_off_t dltotal G_GNUC_UNUSED,
+greenpt_shutdown_check_callback (void *clientp, curl_off_t dltotal G_GNUC_UNUSED,
                  curl_off_t dlnow G_GNUC_UNUSED, curl_off_t ultotal G_GNUC_UNUSED,
                  curl_off_t ulnow G_GNUC_UNUSED)
 {
@@ -305,7 +324,7 @@ greenpt_poll_thread (gpointer data)
   gchar *request_body;
   struct curl_slist *headers = NULL;
   CURL *curl;
-  CURLcode curl_status = CURLE_FAILED_INIT;
+  CURLcode curl_code = CURLE_FAILED_INIT;
 
   memset (&poll_result, 0, sizeof (poll_result));
   poll_result.owner = greenpt;
@@ -328,7 +347,7 @@ greenpt_poll_thread (gpointer data)
       curl_easy_setopt (curl, CURLOPT_URL, url);
       curl_easy_setopt (curl, CURLOPT_POSTFIELDS, request_body);
       curl_easy_setopt (curl, CURLOPT_HTTPHEADER, headers);
-      curl_easy_setopt (curl, CURLOPT_HEADERFUNCTION, greenpt_header_cb);
+      curl_easy_setopt (curl, CURLOPT_HEADERFUNCTION, greenpt_balance_header_callback);
       curl_easy_setopt (curl, CURLOPT_HEADERDATA, &poll_result);
       curl_easy_setopt (curl, CURLOPT_NOSIGNAL, 1L);
       curl_easy_setopt (curl, CURLOPT_TIMEOUT_MS, (long) REQUEST_TIMEOUT_MS);
@@ -339,11 +358,11 @@ greenpt_poll_thread (gpointer data)
          re-sent to every host in a redirect chain, and the endpoint never
          redirects anyway */
       curl_easy_setopt (curl, CURLOPT_NOPROGRESS, 0L);
-      curl_easy_setopt (curl, CURLOPT_XFERINFOFUNCTION, greenpt_xfer_cb);
+      curl_easy_setopt (curl, CURLOPT_XFERINFOFUNCTION, greenpt_shutdown_check_callback);
       curl_easy_setopt (curl, CURLOPT_XFERINFODATA, greenpt);
 
-      curl_status = curl_easy_perform (curl);
-      if (curl_status == CURLE_OK)
+      curl_code = curl_easy_perform (curl);
+      if (curl_code == CURLE_OK)
         curl_easy_getinfo (curl, CURLINFO_RESPONSE_CODE, &poll_result.http_status);
 
       curl_easy_setopt (curl, CURLOPT_HTTPHEADER, NULL);
@@ -354,7 +373,7 @@ greenpt_poll_thread (gpointer data)
   g_free (auth_header);
   g_free (request_body);
 
-  poll_result.curl_code = curl_status;
+  poll_result.curl_code = curl_code;
 
   g_free (request->api_key);
   g_free (request);
@@ -427,7 +446,7 @@ greenpt_poll_finished (gpointer user_data)
            *poll_result->balance_header == '.'))
         {
           result->balance = balance;
-          result->formatted = g_strdup_printf ("%.2f \xE2\x82\xAC", balance);
+          result->formatted = g_strdup_printf ("%.2f %s", balance, LABEL_EURO);
         }
       else
         {
@@ -439,10 +458,11 @@ greenpt_poll_finished (gpointer user_data)
     }
   else
     {
-      result->error = g_strdup_printf ("HTTP %ld without balance header", poll_result->http_status);
+      result->error = g_strdup_printf (ERROR_HTTP_NO_HEADER, poll_result->http_status);
     }
 
-  /* poll_result is owned by the idle's GDestroyNotify (L336), which runs now
+  /* poll_result is owned by the idle's GDestroyNotify (the g_idle_add_full in
+     greenpt_poll_thread), which runs now
      that we return G_SOURCE_REMOVE; do not free it here */
 
   if (result->formatted != NULL)
@@ -454,15 +474,16 @@ greenpt_poll_finished (gpointer user_data)
 
       gtk_label_set_text (GTK_LABEL (greenpt->label), result->formatted);
       if (result->raw_balance)
-        tooltip = g_strdup_printf ("GreenPT %s: %s remaining\nLast update: %s",
+        tooltip = g_strdup_printf ("GreenPT %s: %s remaining%s%s",
                                REGION_NAME[result->region], result->formatted,
-                               greenpt->last_update_time);
+                               TOOLTIP_LAST_UPDATE, greenpt->last_update_time);
       else
         {
           greenpt->have_balance = TRUE;
           greenpt->balance = result->balance;
-          tooltip = g_strdup_printf ("GreenPT %s: %.2f \xE2\x82\xAC remaining\nLast update: %s",
+          tooltip = g_strdup_printf ("GreenPT %s: %.2f %s remaining%s%s",
                                  REGION_NAME[result->region], greenpt->balance,
+                                 LABEL_EURO, TOOLTIP_LAST_UPDATE,
                                  greenpt->last_update_time);
         }
       gtk_widget_set_tooltip_text (greenpt->box, tooltip);
@@ -470,30 +491,33 @@ greenpt_poll_finished (gpointer user_data)
     }
   else if (result->invalid_key)
     {
-      gtk_label_set_text (GTK_LABEL (greenpt->label), "\xE2\x80\x94");
-      gtk_widget_set_tooltip_text (greenpt->box, "GreenPT: invalid API key (401)");
+      gtk_label_set_text (GTK_LABEL (greenpt->label), LABEL_DASH);
+      gtk_widget_set_tooltip_text (greenpt->box, TOOLTIP_INVALID_KEY);
     }
   else if (result->no_credits)
     {
+      gchar *zero_label;
       greenpt->have_balance = TRUE;
       greenpt->balance = 0.0;
-      gtk_label_set_text (GTK_LABEL (greenpt->label), "0.00 \xE2\x82\xAC");
-      gtk_widget_set_tooltip_text (greenpt->box, "GreenPT: no credits left (402)");
+      zero_label = g_strdup_printf ("0.00 %s", LABEL_EURO);
+      gtk_label_set_text (GTK_LABEL (greenpt->label), zero_label);
+      g_free (zero_label);
+      gtk_widget_set_tooltip_text (greenpt->box, TOOLTIP_NO_CREDITS);
     }
   else
     {
       if (greenpt->have_balance)
         {
-          label_text = g_strdup_printf ("%.2f \xE2\x82\xAC", greenpt->balance);
+          label_text = g_strdup_printf ("%.2f %s", greenpt->balance, LABEL_EURO);
           gtk_label_set_text (GTK_LABEL (greenpt->label), label_text);
           g_free (label_text);
         }
       else
-        gtk_label_set_text (GTK_LABEL (greenpt->label), "\xE2\x80\x94");
+        gtk_label_set_text (GTK_LABEL (greenpt->label), LABEL_DASH);
 
-      tooltip = g_strdup_printf ("GreenPT: update failed (%s)%s%s",
-                             result->error != NULL ? result->error : "unknown error",
-                             greenpt->last_update_time != NULL ? "\nLast update: " : "",
+      tooltip = g_strdup_printf (TOOLTIP_UPDATE_FAILED,
+                             result->error != NULL ? result->error : ERROR_UNKNOWN,
+                             greenpt->last_update_time != NULL ? TOOLTIP_LAST_UPDATE : "",
                              greenpt->last_update_time != NULL ? greenpt->last_update_time : "");
       gtk_widget_set_tooltip_text (greenpt->box, tooltip);
       g_free (tooltip);
@@ -502,9 +526,9 @@ greenpt_poll_finished (gpointer user_data)
   /* low balance highlighting */
   style_ctx = gtk_widget_get_style_context (greenpt->label);
   if (greenpt->have_balance && greenpt->balance < greenpt->low_threshold)
-    gtk_style_context_add_class (style_ctx, "greenpt-low");
+    gtk_style_context_add_class (style_ctx, CSS_CLASS_LOW);
   else
-    gtk_style_context_remove_class (style_ctx, "greenpt-low");
+    gtk_style_context_remove_class (style_ctx, CSS_CLASS_LOW);
 
   g_free (result->formatted);
   g_free (result->error);
@@ -513,7 +537,7 @@ greenpt_poll_finished (gpointer user_data)
 }
 
 static gboolean
-greenpt_timeout (gpointer user_data)
+greenpt_refresh_callback (gpointer user_data)
 {
   GreenptPlugin *greenpt = user_data;
   const gchar *resolved_key;
@@ -534,9 +558,7 @@ greenpt_timeout (gpointer user_data)
   if (!greenpt_key_is_safe (resolved_key))
     {
       gtk_label_set_text (GTK_LABEL (greenpt->label), _("Invalid API Key"));
-      gtk_widget_set_tooltip_text (greenpt->box,
-        "GreenPT: the API key contains control or non-ASCII characters and "
-        "was not sent \xE2\x80\x94 fix $GREENPT_API_TOKEN or the key in Properties");
+      gtk_widget_set_tooltip_text (greenpt->box, TOOLTIP_UNSAFE_KEY);
       g_warning ("greenpt: API key contains control or non-ASCII characters; not sending it");
       return G_SOURCE_CONTINUE;
     }
@@ -562,14 +584,14 @@ greenpt_timeout (gpointer user_data)
 }
 
 static void
-greenpt_schedule (GreenptPlugin *greenpt)
+greenpt_schedule_refresh (GreenptPlugin *greenpt)
 {
   if (greenpt->refresh_timeout_id != 0)
     g_source_remove (greenpt->refresh_timeout_id);
   greenpt->refresh_timeout_id = g_timeout_add_seconds (greenpt->refresh_seconds,
-                                          greenpt_timeout, greenpt);
+                                           greenpt_refresh_callback, greenpt);
   /* fetch right away as well */
-  greenpt_timeout (greenpt);
+  greenpt_refresh_callback (greenpt);
 }
 
 
@@ -605,7 +627,7 @@ greenpt_entry_sensitive_toggled (GtkToggleButton *toggle, gpointer user_data)
 static void
 greenpt_key_entry_changed (GtkEditable *editable, gpointer user_data G_GNUC_UNUSED)
 {
-  g_object_set_data (G_OBJECT (editable), "greenpt-key-edited",
+  g_object_set_data (G_OBJECT (editable), DATA_KEY_EDITED,
                      GINT_TO_POINTER (TRUE));
 }
 
@@ -680,7 +702,7 @@ greenpt_configure (XfcePanelPlugin *plugin, GreenptPlugin *greenpt)
   gtk_widget_set_tooltip_text (key_entry,
     _("Stored in plaintext in the panel configuration file. "
       "Prefer $GREENPT_API_TOKEN if the key must not touch disk."));
-  g_object_set_data (G_OBJECT (key_entry), "greenpt-key-edited",
+  g_object_set_data (G_OBJECT (key_entry), DATA_KEY_EDITED,
                      GINT_TO_POINTER (FALSE));
   g_signal_connect (G_OBJECT (key_entry), "changed",
                     G_CALLBACK (greenpt_key_entry_changed), NULL);
@@ -699,8 +721,8 @@ greenpt_configure (XfcePanelPlugin *plugin, GreenptPlugin *greenpt)
   gtk_grid_attach (GTK_GRID (grid), label, 0, 2, 1, 1);
 
   region_combo = gtk_combo_box_text_new ();
-  gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (region_combo), "EU");
-  gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (region_combo), "US");
+  gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (region_combo), REGION_NAME[REGION_EU]);
+  gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (region_combo), REGION_NAME[REGION_US]);
   gtk_combo_box_set_active (GTK_COMBO_BOX (region_combo), greenpt->region);
   gtk_grid_attach (GTK_GRID (grid), region_combo, 1, 2, 1, 1);
 
@@ -736,7 +758,7 @@ greenpt_configure (XfcePanelPlugin *plugin, GreenptPlugin *greenpt)
       /* only accept the entry contents when the user actually edited it;
          untouched means the masked placeholder is still showing */
       if (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (key_entry),
-                                              "greenpt-key-edited")))
+                                              DATA_KEY_EDITED)))
         {
           const gchar *entered = gtk_entry_get_text (GTK_ENTRY (key_entry));
           if (greenpt_key_is_safe (entered))
@@ -756,7 +778,7 @@ greenpt_configure (XfcePanelPlugin *plugin, GreenptPlugin *greenpt)
       greenpt->low_threshold = gtk_spin_button_get_value (GTK_SPIN_BUTTON (threshold_spin));
 
       greenpt_config_save (greenpt);
-      greenpt_schedule (greenpt);
+      greenpt_schedule_refresh (greenpt);
     }
 
   /* skip if the dialog was destroyed elsewhere (free-data) */
@@ -842,7 +864,7 @@ greenpt_construct (XfcePanelPlugin *plugin)
 
   greenpt->css_provider = gtk_css_provider_new ();
   gtk_css_provider_load_from_data (greenpt->css_provider,
-                                   ".greenpt-low { color: #ff4040; }",
+                                   CSS_LOW_VALUE_RULE,
                                    -1, NULL);
   gtk_style_context_add_provider_for_screen (
     gdk_screen_get_default (), GTK_STYLE_PROVIDER (greenpt->css_provider),
@@ -856,7 +878,7 @@ greenpt_construct (XfcePanelPlugin *plugin)
   gtk_container_add (GTK_CONTAINER (greenpt->box), greenpt->hbox);
 
   greenpt->image = gtk_image_new_from_icon_name ("greenpt", GTK_ICON_SIZE_MENU);
-  greenpt->label = gtk_label_new ("\xE2\x80\x94");
+  greenpt->label = gtk_label_new (LABEL_DASH);
 
   gtk_box_pack_start (GTK_BOX (greenpt->hbox), greenpt->image, FALSE, FALSE, 2);
   gtk_box_pack_start (GTK_BOX (greenpt->hbox), greenpt->label, FALSE, FALSE, 2);
@@ -875,7 +897,7 @@ greenpt_construct (XfcePanelPlugin *plugin)
   g_signal_connect (G_OBJECT (plugin), "configure-plugin",
                     G_CALLBACK (greenpt_configure), greenpt);
 
-  greenpt_schedule (greenpt);
+  greenpt_schedule_refresh (greenpt);
 }
 
 XFCE_PANEL_PLUGIN_REGISTER (greenpt_construct)
