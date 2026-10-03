@@ -26,8 +26,8 @@ Libdir suffix derived from panel's pkg-config data as libdir relative to prefix 
 ## Use
 
 1. `xfce4-panel -r` (rescan plugin dirs)
-2. Panel ▸ Items ▸ + ▸ "GreenPT Credits"
-3. Right-click item ▸ Properties: API key (account.greenpt.ai), region (EU/US), refresh interval seconds (default 300, min 10), low-balance threshold (default 5.00).
+2. Panel -> Items -> + -> "GreenPT Credits"
+3. Right-click item -> Properties: API key (account.greenpt.ai), region (EU/US), refresh interval seconds (default 300, min 10), low-balance threshold (default 5.00).
 
 No key → button shows **"Missing API Key"**. Enter key in Properties, or enable **"Use $GREENPT_API_TOKEN environment variable"** — reads key from panel session env, not stored in rc file (env wins when enabled).
 
