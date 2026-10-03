@@ -1,0 +1,9 @@
+[Xfce Panel]
+Type=X-XFCE-PanelPlugin
+Name=GreenPT Credits
+Comment=Show remaining GreenPT API credit
+Icon=greenpt
+X-XFCE-Module=greenpt
+X-XFCE-API=2.0
+X-XFCE-Internal=FALSE
+X-XFCE-Unique=TRUE
